@@ -129,6 +129,9 @@ const int ABORT_INTERVAL = 100; // ms
 
 int mmal_status_to_int(MMAL_STATUS_T status);
 void my_annotate (MMAL_COMPONENT_T *camera, const char *string);
+static void encoder_buffer_callback_raw_tcp(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer);
+static void encoder_buffer_callback_android(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer);
+
 
 // Forward
 typedef struct RASPIVID_STATE_S RASPIVID_STATE;
@@ -209,8 +212,6 @@ struct RASPIVID_STATE_S
 
    PORT_USERDATA callback_data;        /// Used to move data to the encoder callback
 
-   //int inlineMotionVectors;             /// Encoder outputs inline Motion Vectors
-   char *imv_filename;                  /// filename of inline Motion Vectors output
    int raw_output;                      /// Output raw video from camera as well
    RAW_OUTPUT_FMT raw_output_fmt;       /// The raw video format
    char *raw_filename;                  /// Filename for raw video output
@@ -219,7 +220,6 @@ struct RASPIVID_STATE_S
    int sensor_mode;			            /// Sensor mode. 0=auto. Check docs/forum for modes selected by other values.
    int intra_refresh_type;              /// What intra refresh type to use. -1 to not set.
    int frame;
-   char *pts_filename;
    int save_pts;
    int64_t starttime;
    int64_t lasttime;
@@ -228,6 +228,8 @@ struct RASPIVID_STATE_S
 
    int64_t i64FramesCnt;
    int64_t i64FramesSkip;
+
+   MMAL_PORT_BH_CB_T enc_cb_func;
 };
 
 
@@ -252,25 +254,6 @@ static XREF_T  level_map[] =
 
 static int level_map_size = sizeof(level_map) / sizeof(level_map[0]);
 
-
-static XREF_T  initial_map[] =
-{
-   {"record",     0},
-   {"pause",      1},
-};
-
-static int initial_map_size = sizeof(initial_map) / sizeof(initial_map[0]);
-
-static XREF_T  intra_refresh_map[] =
-{
-   {"cyclic",       MMAL_VIDEO_INTRA_REFRESH_CYCLIC},
-   {"adaptive",     MMAL_VIDEO_INTRA_REFRESH_ADAPTIVE},
-   {"both",         MMAL_VIDEO_INTRA_REFRESH_BOTH},
-   {"cyclicrows",   MMAL_VIDEO_INTRA_REFRESH_CYCLIC_MROWS},
-//   {"random",       MMAL_VIDEO_INTRA_REFRESH_PSEUDO_RAND} Cannot use random, crashes the encoder. No idea why.
-};
-
-static int intra_refresh_map_size = sizeof(intra_refresh_map) / sizeof(intra_refresh_map[0]);
 
 static XREF_T  raw_output_fmt_map[] =
 {
@@ -306,7 +289,7 @@ static int raw_output_fmt_map_size = sizeof(raw_output_fmt_map) / sizeof(raw_out
 #define CommandSegmentStart 20
 #define CommandSplitWait    21
 #define CommandCircular     22
-#define CommandIMV          23
+#define CommandMode          23
 #define CommandCamSelect    24
 #define CommandSettings     25
 #define CommandSensorMode   26
@@ -340,6 +323,7 @@ static COMMAND_LIST cmdline_commands[] =
    { CommandQP,            "-qp",         "qp", "Quantisation parameter. Use approximately 10-40. Default 0 (off)", 1},
    { CommandInlineHeaders, "-inline",     "ih", "Insert inline headers (SPS, PPS) to stream", 0},
    { CommandSplitWait,     "-split",      "sp", "In wait mode, create new output file for each start event", 0},
+   { CommandMode,     "-mode",     "m", "android or raw_tcp", 1},
    { CommandCamSelect,     "-camselect",  "cs", "Select camera <number>. Default 0", 1 },
    { CommandSettings,      "-settings",   "set","Retrieve camera settings and write to stdout", 0},
    { CommandSensorMode,    "-mode",       "md", "Force sensor mode. 0=auto. See docs for other modes available", 1},
@@ -450,7 +434,6 @@ static void dump_status(RASPIVID_STATE *state)
    fprintf(stderr, "H264 Profile %s\n", raspicli_unmap_xref(state->profile, profile_map, profile_map_size));
    fprintf(stderr, "H264 Level %s\n", raspicli_unmap_xref(state->level, level_map, level_map_size));
    fprintf(stderr, "H264 Quantisation level %d, Inline headers %s\n", state->quantisationParameter, state->bInlineHeaders ? "Yes" : "No");
-   fprintf(stderr, "H264 Intra refresh type %s, period %d\n", raspicli_unmap_xref(state->intra_refresh_type, intra_refresh_map, intra_refresh_map_size), state->intraperiod);
 
    // Not going to display segment data unless asked for it.
    if (state->segmentSize)
@@ -514,6 +497,28 @@ static int parse_cmdline(int argc, const char **argv, RASPIVID_STATE *state)
       {
       case CommandHelp:
          return -1;
+
+         case CommandMode:
+         {
+            if (0 == strcmp(argv[i + 1], "android"))
+            {
+               i++;
+               fprintf(stderr, "encoder_buffer_callback_android\n");
+               state->enc_cb_func = encoder_buffer_callback_android;
+            }
+            else if (0 == strcmp(argv[i + 1], "raw_tcp"))
+            {
+               i++;
+               fprintf(stderr, "encoder_buffer_callback_raw_tcp\n");
+               state->enc_cb_func = encoder_buffer_callback_raw_tcp;
+            }
+            else
+            {
+               fprintf(stderr, "mode must be: android or raw_tcp\n");
+               valid = 0;
+            }
+         }
+         break;
 
       case CommandWidth: // Width > 0
          if (sscanf(argv[i + 1], "%u", &state->width) != 1)
@@ -655,13 +660,6 @@ static int parse_cmdline(int argc, const char **argv, RASPIVID_STATE *state)
          break;
       }
 
-      case CommandIntraRefreshType:
-      {
-         state->intra_refresh_type = raspicli_map_xref(argv[i + 1], intra_refresh_map, intra_refresh_map_size);
-         i++;
-         break;
-      }
-
       case CommandLevel: // H264 level
       {
          state->level = raspicli_map_xref(argv[i + 1], level_map, level_map_size);
@@ -785,7 +783,7 @@ receive_commands (RASPIVID_STATE* pState)
          {
             if (1 == sscanf(line, "iso=%d\n", &iPar))
             {
-               int tt = raspicamcontrol_set_ISO(pState->camera_component, iPar);
+               raspicamcontrol_set_ISO(pState->camera_component, iPar);
                //printf("%d, %d\n", iPar, tt);
             }
          }
@@ -793,7 +791,7 @@ receive_commands (RASPIVID_STATE* pState)
          {
             if (1 == sscanf(line, "ss=%d\n", &iPar))
             {
-               int tt = raspicamcontrol_set_shutter_speed(pState->camera_component, iPar);
+               raspicamcontrol_set_shutter_speed(pState->camera_component, iPar);
                //printf("ss=%d, %d\n", iPar, tt);
             }
          }
@@ -1030,7 +1028,7 @@ return max_vxvy;
    if(pstate->motion_verbose & MOTION_DEBUG_STRONGNESS)
       fprintf(stderr, "max_vx=%d, max_vy=%d, time us=%llu\n", max_vx, max_vy, vcos_getmicrosecs64() - t_b);
    return 0;
-   _loop_end:
+   //_loop_end:
    if(sum > pstate->motion_threshold)
       return 1;
    return 0;
@@ -1166,7 +1164,7 @@ static void encoder_buffer_callback_android(MMAL_PORT_T *port, MMAL_BUFFER_HEADE
    }// if (port->is_enabled)
 }
 
-static void encoder_buffer_callback_write_separate(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
+static void encoder_buffer_callback_empty(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
 {
    MMAL_BUFFER_HEADER_T *new_buffer;
    PORT_USERDATA *pData = (PORT_USERDATA *)port->userdata;
@@ -1179,8 +1177,6 @@ static void encoder_buffer_callback_write_separate(MMAL_PORT_T *port, MMAL_BUFFE
          mmal_buffer_header_mem_lock(buffer);
 
          PrintDataType(pData, buffer);
-
-         //WriteToFile(buffer);
 
          //H264 data comes first, then comes motion vectors
          if (buffer->flags & MMAL_BUFFER_HEADER_FLAG_CODECSIDEINFO)
@@ -1224,7 +1220,7 @@ static void encoder_buffer_callback_write_separate(MMAL_PORT_T *port, MMAL_BUFFE
    }
 }
 
-static void encoder_buffer_callback_minimal(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
+static void encoder_buffer_callback_raw_tcp(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
 {
    MMAL_BUFFER_HEADER_T *new_buffer;
    PORT_USERDATA *pData = (PORT_USERDATA *)port->userdata;
@@ -2285,7 +2281,7 @@ int main(int argc, const char **argv)
          }
 
          // Enable the encoder output port and tell it its callback function
-         status = mmal_port_enable(encoder_output_port, encoder_buffer_callback_android);
+         status = mmal_port_enable(encoder_output_port, state.enc_cb_func);
          if (status != MMAL_SUCCESS)
          {
             vcos_log_error("Failed to setup encoder output");
