@@ -6,6 +6,7 @@ import android.content.Context;
 import android.graphics.SurfaceTexture;
 import android.media.MediaCodec;
 import android.media.MediaFormat;
+import android.media.MediaPlayer;
 import android.os.Bundle;
 import android.os.Handler;
 import android.support.v4.app.Fragment;
@@ -63,7 +64,7 @@ public class VideoFragment extends Fragment implements TextureView.SurfaceTextur
 	private boolean fullScreen;
 	private DecoderThread decoderThread;
 	private ZoomPanTextureView textureView;
-	private TextView textViewSS, messageView, framesView, textViewISO;
+	private TextView textViewSS, messageView, framesView, textViewISO, textViewFPS;
 	private Button button_SS, button_move_up, button_move_down, button_zoom_reset, button_move_left, button_move_right, button_mot, button_zoom_in, button_zoom_out;
 	private Runnable fadeInRunner, fadeOutRunner, finishRunner, startVideoRunner;
 	private Handler fadeInHandler, fadeOutHandler, finishHandler, startVideoHandler;
@@ -195,8 +196,11 @@ public class VideoFragment extends Fragment implements TextureView.SurfaceTextur
 			@Override
 			public void run()
 			{
-                if(getActivity() != null)
+                if(getActivity() != null) {
+                    MediaPlayer mp = MediaPlayer.create(getActivity(), R.raw.airbus_autopilot);
+                    mp.start();
                     getActivity().finish();
+                }
 			}
 		};
 
@@ -259,6 +263,7 @@ public class VideoFragment extends Fragment implements TextureView.SurfaceTextur
         });
 
 
+        views_to_fade.add(textViewFPS = (TextView)view.findViewById(R.id.frames_cnt));
         views_to_fade.add(textViewSS = (TextView)view.findViewById(R.id.shutter_speed));
 
         views_to_fade.add(button_zoom_in = (Button)view.findViewById(R.id.button_zoom_in));
