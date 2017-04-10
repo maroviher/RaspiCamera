@@ -129,8 +129,41 @@ const int ABORT_INTERVAL = 100; // ms
 int mmal_status_to_int(MMAL_STATUS_T status);
 void my_annotate (MMAL_COMPONENT_T *camera, const char *string);
 static void encoder_buffer_callback_raw_tcp(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer);
+static void encoder_buffer_callback_android_dimon(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer);
 static void encoder_buffer_callback_android_motion(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer);
 static void encoder_buffer_callback_android(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer);
+
+static struct
+{
+   const char* strCallbackName;
+   void* pCallbackFunc;
+} callback_modes[] =
+{
+      {"raw_tcp",        encoder_buffer_callback_raw_tcp},
+      {"android_dimon",  encoder_buffer_callback_android_dimon},
+      {"android_motion", encoder_buffer_callback_android_motion},
+      {"android",        encoder_buffer_callback_android},
+};
+
+static int callback_modes_count = sizeof(callback_modes) / sizeof(callback_modes[0]);
+
+void print_callbacks()
+{
+   int i;
+   for(i = 0; i < callback_modes_count; i++)
+      fprintf(stderr, "%s\n", callback_modes[i].strCallbackName);
+}
+
+void* find_callback_by_name(const char* _strCallbackName)
+{
+   int i;
+   for(i = 0; i < callback_modes_count; i++)
+   {
+      if(0 == strcmp(callback_modes[i].strCallbackName, _strCallbackName))
+         return callback_modes[i].pCallbackFunc;
+   }
+   return 0;
+}
 
 MMAL_PORT_T *camera_preview_port = NULL;
 MMAL_PORT_T *camera_video_port = NULL;
@@ -317,6 +350,7 @@ static COMMAND_LIST cmdline_commands[] =
 
 static int cmdline_commands_size = sizeof(cmdline_commands) / sizeof(cmdline_commands[0]);
 MMAL_PORT_T *g_encoder_output = NULL;
+int gMotionAlarm = 0;
 
 static struct
 {
@@ -579,31 +613,14 @@ static int parse_cmdline(int argc, const char **argv, RASPIVID_STATE *state)
             return -1;
 
         case CommandMode:
-        {
-            if (0 == strcmp(argv[i + 1], "android_motion"))
-            {
-                i++;
-                fprintf(stderr, "encoder_buffer_callback_android_motion\n");
-                state->enc_cb_func = encoder_buffer_callback_android_motion;
-            }
-            else if (0 == strcmp(argv[i + 1], "android"))
-            {
-                i++;
-                fprintf(stderr, "encoder_buffer_callback_android\n");
-                state->enc_cb_func = encoder_buffer_callback_android;
-            }
-            else if (0 == strcmp(argv[i + 1], "raw_tcp"))
-            {
-                i++;
-                fprintf(stderr, "encoder_buffer_callback_raw_tcp\n");
-                state->enc_cb_func = encoder_buffer_callback_raw_tcp;
-            }
-            else
-            {
-                fprintf(stderr, "mode must be: android_motion, android, raw_tcp\n");
-                valid = 0;
-            }
-        }
+           if(NULL == (state->enc_cb_func = find_callback_by_name(argv[i + 1])))
+           {
+              fprintf(stderr, "'%s' is an unknown operation mode, use one of:\n", argv[i + 1]);
+              print_callbacks();
+              exit(-1);
+           }
+           else
+              i++;
          break;
 
       case CommandWidth: // Width > 0
@@ -856,6 +873,16 @@ static void camera_control_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
 /* not sure if here everything is correct */
 static void SwitchMotionVectorsOnFly(RASPIVID_STATE* pState, int bTurnOn)
 {
+   //first check if we already have the needed state
+   MMAL_BOOL_T currState;
+   if (MMAL_SUCCESS != mmal_port_parameter_get_boolean(g_encoder_output, MMAL_PARAMETER_VIDEO_ENCODE_INLINE_VECTORS, &currState))
+   {
+       fprintf(stderr, "mmal_port_parameter_get_boolean error at line:%d\n", __LINE__);
+       return;
+   }
+   if(currState == bTurnOn)
+      return;
+
     if (MMAL_SUCCESS != mmal_port_parameter_set_boolean(camera_video_port, MMAL_PARAMETER_CAPTURE, 0))
         fprintf(stderr, "%d\n", __LINE__);
     if (MMAL_SUCCESS != mmal_connection_disable(pState->encoder_connection))
@@ -934,14 +961,23 @@ void receive_commands(RASPIVID_STATE* pState)
             }
             else if (!strncmp("motion=", line, 7))
             {
-                if (1 == sscanf(line, "motion=%d\n", &iPar))
-                {
-                    SwitchMotionVectorsOnFly(pState, iPar);
-                }
+               //only switch off motion vectors if motion alarm is turned off
+               if (gMotionAlarm == 0)
+               {
+                  if (1 == sscanf(line, "motion=%d\n", &iPar))
+                     SwitchMotionVectorsOnFly(pState, iPar);
+               }
             }
             else if (!strncmp("move=", line, 5))
             {
                 my_raspicamcontrol_zoom_in_zoom_out(pState->camera_component, line[5]);
+            }
+            else if (!strncmp("mot_alarm=", line, 10))
+            {
+               if (1 == sscanf(line, "mot_alarm=%d\n", &gMotionAlarm))
+               {
+                  SwitchMotionVectorsOnFly(pState, (gMotionAlarm==0)?(0):(1));
+               }
             }
 
         }//while ((read = getline(&line, &len, fpSock)) != -1)
@@ -1202,14 +1238,29 @@ void PrintDataType(PORT_USERDATA *pData, MMAL_BUFFER_HEADER_T *buffer)
    fprintf(stderr, "\n");
 }
 
+typedef enum ANDROID_DATA_TYPES
+{
+    CurrentResolution=0,
+    RegularFrame,
+    MotionInFrame,
+    MotionAlarm
+} ANDROID_DATA_TYPES;
+
+
 void SendToAndroid(int sockFD, void* buf, size_t len)
 {
+   //size of an unsent data in skb
+   /*#include <sys/ioctl.h>
+   unsigned long size;
+   ioctl( sockFD, TIOCOUTQ, &size );
+   fprintf(stderr, "%d\n", size);*/
+
    if(len != send(sockFD, buf, len, MSG_NOSIGNAL))
       exit(__LINE__);//TCP connection closed, stop program
 }
 MMAL_BUFFER_HEADER_T* p_buf_partial_begin = NULL;
 
-static void encoder_buffer_callback_android_motion(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
+static void encoder_buffer_callback_android_dimon(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
 {
    MMAL_BUFFER_HEADER_T *new_buffer;
    PORT_USERDATA *pData = (PORT_USERDATA *)port->userdata;
@@ -1232,7 +1283,6 @@ static void encoder_buffer_callback_android_motion(MMAL_PORT_T *port, MMAL_BUFFE
             //H264 data comes first, then comes motion vectors
             if (buffer->flags & MMAL_BUFFER_HEADER_FLAG_CODECSIDEINFO)
             {   //motion vectors
-               printf("%d\n", (int)DetectMotion((INLINE_MOTION_VECTOR*) &buffer->data[0], pData->pstate));
             }
             else
             {   //H264 data
@@ -1273,6 +1323,120 @@ static void encoder_buffer_callback_android_motion(MMAL_PORT_T *port, MMAL_BUFFE
                   else
                   {
                      //printf("not buffer->length=%d, buffer->length=0x%x\n", buffer->length, buffer->length);
+                     SendToAndroid(pData->sockFD, &buffer->length, 4);   //send first the length of a frame
+                     SendToAndroid(pData->sockFD, buffer->data, buffer->length);   //send the frame
+                  }
+                  handle_frame_end(pData);
+               }
+            }
+         }//if (buffer->flags & MMAL_BUFFER_HEADER_FLAG_CONFIG)
+
+         if(!p_buf_partial_begin)
+            mmal_buffer_header_mem_unlock(buffer);
+      }
+   }
+   else
+   {
+      vcos_log_error("Received a encoder buffer callback with no state");
+   }
+
+   // release buffer back to the pool
+   if(!p_buf_partial_begin)
+      mmal_buffer_header_release(buffer);
+
+   // and send one back to the port (if still open)
+   if (port->is_enabled && !p_buf_partial_begin)
+   {
+      if (NULL == (new_buffer = mmal_queue_get(pData->pstate->encoder_pool->queue)))
+         vcos_log_error("mmal_queue_get");
+      else
+      {
+         MMAL_STATUS_T status = mmal_port_send_buffer(port, new_buffer);
+         if (status != MMAL_SUCCESS)
+            vcos_log_error("mmal_port_send_buffer=%d", status);
+      }
+   }// if (port->is_enabled)
+}
+
+static void encoder_buffer_callback_android_motion(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
+{
+   MMAL_BUFFER_HEADER_T *new_buffer;
+   PORT_USERDATA *pData = (PORT_USERDATA *)port->userdata;
+
+   if (pData)
+   {
+      if (buffer->length)
+      {
+         uint8_t dataType;
+         mmal_buffer_header_mem_lock(buffer);
+
+         //PrintDataType(pData, buffer);
+         static char b1_config_sent = 0;//sent SPS/PPS only one time on the beginning
+         if ((b1_config_sent < 2) && buffer->flags & MMAL_BUFFER_HEADER_FLAG_CONFIG)
+         {
+            b1_config_sent++;
+            SendToAndroid(pData->sockFD, &buffer->length, 4);
+            SendToAndroid(pData->sockFD, buffer->data, buffer->length);
+         }
+         else
+         {
+            //H264 data comes first, then comes motion vectors
+            if (buffer->flags & MMAL_BUFFER_HEADER_FLAG_CODECSIDEINFO)
+            {   //motion vectors
+               dataType = (uint8_t)MotionInFrame;
+               SendToAndroid(pData->sockFD, &dataType, 1);
+               unsigned char mot = DetectMotion((INLINE_MOTION_VECTOR*) &buffer->data[0], pData->pstate);
+               SendToAndroid(pData->sockFD, &mot, 1);
+
+               if((gMotionAlarm != 0) && ((int)mot) > gMotionAlarm)
+               {
+                  dataType = (uint8_t)MotionAlarm;
+                  SendToAndroid(pData->sockFD, &dataType, 1);
+               }
+            }
+            else
+            {   //H264 data
+               if (0 == buffer->flags)
+               {//begin of a partial frame
+                  if(p_buf_partial_begin)
+                  {
+                     printf("Error in logic, p_buf_partial_begin\n");
+                     exit(12);
+                  }
+                  p_buf_partial_begin = buffer;
+               }
+               else if (buffer->flags & MMAL_BUFFER_HEADER_FLAG_FRAME_END)
+               {//a complete frame or the end of a partial frame
+                  dataType = (uint8_t)RegularFrame;
+                  if(p_buf_partial_begin)
+                  {
+                     uint32_t all_length = p_buf_partial_begin->length + buffer->length;
+
+                     //printf("    partial, p_buf_partial_begin->length=%u, buffer->length=%u, all_length=0x%x\n", p_buf_partial_begin->length, buffer->length, all_length);
+
+                     SendToAndroid(pData->sockFD, &dataType,                        1);
+                     SendToAndroid(pData->sockFD, &all_length,                      4);   //send first the length of a frame
+                     SendToAndroid(pData->sockFD, p_buf_partial_begin->data, p_buf_partial_begin->length);   //send the frame
+                     SendToAndroid(pData->sockFD, buffer->data,                    buffer->length);   //send the frame
+                     mmal_buffer_header_mem_unlock(p_buf_partial_begin);
+                     mmal_buffer_header_release(p_buf_partial_begin);
+                     if (port->is_enabled)
+                     {
+                        if (NULL == (new_buffer = mmal_queue_get(pData->pstate->encoder_pool->queue)))
+                           vcos_log_error("mmal_queue_get");
+                        else
+                        {
+                           MMAL_STATUS_T status = mmal_port_send_buffer(port, new_buffer);
+                           if (status != MMAL_SUCCESS)
+                              vcos_log_error("mmal_port_send_buffer=%d", status);
+                        }
+                     }// if (port->is_enabled)
+                     p_buf_partial_begin = NULL;
+                  }
+                  else
+                  {
+                     //printf("not buffer->length=%d, buffer->length=0x%x\n", buffer->length, buffer->length);
+                     SendToAndroid(pData->sockFD, &dataType,                        1);
                      SendToAndroid(pData->sockFD, &buffer->length, 4);   //send first the length of a frame
                      SendToAndroid(pData->sockFD, buffer->data, buffer->length);   //send the frame
                   }
@@ -2241,6 +2405,18 @@ int main(int argc, const char **argv)
       exit(EX_USAGE);
    }
 
+   if (state.filename)
+   {
+      state.callback_data.file_handle = open_filename(&state, state.filename, &state.callback_data.sockFD);
+
+      if (!state.callback_data.file_handle)
+      {
+         // Notify user, carry on but discarding encoded output buffers
+         vcos_log_error("%s: Error opening output file: %s\nNo output file will be generated\n", __func__, state.filename);
+         exit(1);
+      }
+   }
+
    // OK, we have a nice set of parameters. Now set up our components
    // We have three components. Camera, Preview and encoder.
 
@@ -2290,18 +2466,6 @@ int main(int argc, const char **argv)
          state.callback_data.pstate = &state;
          state.callback_data.abort = 0;
          state.callback_data.file_handle = NULL;
-
-         if (state.filename)
-         {
-            state.callback_data.file_handle = open_filename(&state, state.filename, &state.callback_data.sockFD);
-
-            if (!state.callback_data.file_handle)
-            {
-               // Notify user, carry on but discarding encoded output buffers
-               vcos_log_error("%s: Error opening output file: %s\nNo output file will be generated\n", __func__, state.filename);
-               exit(1);
-            }
-         }
 
          // Set up our userdata - this is passed though to the callback where we need the information.
          encoder_output_port->userdata = (struct MMAL_PORT_USERDATA_T *)&state.callback_data;
