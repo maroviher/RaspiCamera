@@ -434,7 +434,7 @@ main (int argc, char** argv)
 
    bool bListen = false, bVerbose = false;
    unsigned short port, recv_timeout = 3;
-   struct in_addr ip;
+   struct in_addr ip={};
    int opt;
    while ((opt = getopt(argc, argv, "t:vlh:p:")) != -1)
    {
