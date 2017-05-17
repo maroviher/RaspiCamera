@@ -1275,8 +1275,24 @@ static void encoder_buffer_callback_android_dimon(MMAL_PORT_T *port, MMAL_BUFFER
 
          if (buffer->flags & MMAL_BUFFER_HEADER_FLAG_CONFIG)
          {
-            SendToAndroid(pData->sockFD, &buffer->length, 4);
-            SendToAndroid(pData->sockFD, buffer->data, buffer->length);
+            static char dimon_sps_buf[30];
+            static uint32_t dimon_sps_len = 0;
+            //sps/pps comes in 2 callbacks
+            if(dimon_sps_len == 0)//do not send a first part of sps/pps immediately
+            {//but store it temporarly
+               if(sizeof(dimon_sps_buf) < buffer->length)
+                  exit(__LINE__);
+               dimon_sps_len = buffer->length;
+               memcpy(dimon_sps_buf, buffer->data, dimon_sps_len);
+            }
+            else
+            {//wait for the second part and send both parts in one chunk
+               uint32_t uiTmp = dimon_sps_len;
+               dimon_sps_len += buffer->length;
+               SendToAndroid(pData->sockFD, &dimon_sps_len, 4);
+               SendToAndroid(pData->sockFD, &dimon_sps_buf, uiTmp);
+               SendToAndroid(pData->sockFD, buffer->data, buffer->length);
+            }
          }
          else
          {
