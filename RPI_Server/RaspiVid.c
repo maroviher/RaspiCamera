@@ -378,8 +378,8 @@ int my_raspicamcontrol_zoom_in_zoom_out(MMAL_COMPONENT_T *camera, char direction
         vcos_log_error("mmal_port_parameter_get(camera->control, &crop.hdr) failed, skip it");
         return 0;
     }
-    printf("->crop.rect.x=%d,crop.rect.y=%d,crop.rect.width=%d,crop.rect.height=%d\n",
-            crop.rect.x, crop.rect.y, crop.rect.width, crop.rect.height);
+    /*printf("->crop.rect.x=%d,crop.rect.y=%d,crop.rect.width=%d,crop.rect.height=%d\n",
+            crop.rect.x, crop.rect.y, crop.rect.width, crop.rect.height);*/
 
     int iMoveStep = 500, zoom_increment_16P16 = 65536/10;
     switch(direction)
@@ -463,8 +463,8 @@ int my_raspicamcontrol_zoom_in_zoom_out(MMAL_COMPONENT_T *camera, char direction
             crop.rect.x = 65536;
         break;
     }
-    printf("<-crop.rect.x=%d,crop.rect.y=%d,crop.rect.width=%d,crop.rect.height=%d\n",
-            crop.rect.x, crop.rect.y, crop.rect.width, crop.rect.height);
+    /*printf("<-crop.rect.x=%d,crop.rect.y=%d,crop.rect.width=%d,crop.rect.height=%d\n",
+            crop.rect.x, crop.rect.y, crop.rect.width, crop.rect.height);*/
 
     int ret = mmal_status_to_int(mmal_port_parameter_set(camera->control, &crop.hdr));
 
@@ -1387,10 +1387,10 @@ static void encoder_buffer_callback_android_motion(MMAL_PORT_T *port, MMAL_BUFFE
          mmal_buffer_header_mem_lock(buffer);
 
          //PrintDataType(pData, buffer);
-         static char b1_config_sent = 0;//sent SPS/PPS only one time on the beginning
-         if ((b1_config_sent < 2) && buffer->flags & MMAL_BUFFER_HEADER_FLAG_CONFIG)
+         static bool b_config_sent = false;//sent SPS/PPS only one time on the beginning
+         if ((!b_config_sent) && buffer->flags & MMAL_BUFFER_HEADER_FLAG_CONFIG)
          {
-            b1_config_sent++;
+            b_config_sent = true;
             SendToAndroid(pData->sockFD, &buffer->length, 4);
             SendToAndroid(pData->sockFD, buffer->data, buffer->length);
          }
